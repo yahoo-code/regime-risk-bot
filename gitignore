@@ -1,0 +1,9 @@
+user_data/data/
+user_data/backtest_results/
+user_data/config_exchange.json
+user_data/*.sqlite
+user_data/logs/
+logs/
+# never commit real keys:
+user_data/config_live.json
+.env

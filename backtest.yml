@@ -1,0 +1,92 @@
+name: backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      exchange:
+        description: "Exchange (okx, gate, bybit, binance, hyperliquid...). Some block GitHub (US) IPs."
+        default: "okx"
+      days:
+        description: "Days of data to download"
+        default: "700"
+      timerange_in:
+        description: "In-sample range"
+        default: "20250301-20250901"
+      timerange_out:
+        description: "Out-of-sample range"
+        default: "20250901-20261101"
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      FT: docker run --rm -v ${{ github.workspace }}/user_data:/freqtrade/user_data freqtradeorg/freqtrade:stable
+      CFG: -c user_data/config.json -c user_data/config_exchange.json
+      STRAT: --strategy RegimeRiskStrategy --strategy-path user_data/strategies
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare
+        shell: bash
+        run: |
+          mkdir -p user_data/data user_data/backtest_results logs
+          echo '{"exchange":{"name":"${{ inputs.exchange }}"}}' > user_data/config_exchange.json
+
+      - name: Restore data cache
+        uses: actions/cache@v4
+        with:
+          path: user_data/data
+          key: data-${{ inputs.exchange }}-${{ inputs.days }}
+
+      - name: Permissions
+        shell: bash
+        run: sudo chmod -R 777 user_data
+
+      - name: Download data (15m + 1h, futures)
+        shell: bash
+        run: |
+          $FT download-data $CFG --trading-mode futures --timeframes 15m 1h --days ${{ inputs.days }} 2>&1 | tee logs/download.txt
+
+      - name: Backtest in-sample
+        shell: bash
+        run: |
+          $FT backtesting $CFG $STRAT --timerange ${{ inputs.timerange_in }} --enable-protections --breakdown month --cache none 2>&1 | tee logs/backtest_in.txt
+
+      - name: Backtest out-of-sample
+        shell: bash
+        run: |
+          $FT backtesting $CFG $STRAT --timerange ${{ inputs.timerange_out }} --enable-protections --breakdown month --cache none 2>&1 | tee logs/backtest_out.txt
+
+      - name: Lookahead analysis
+        continue-on-error: true
+        shell: bash
+        run: |
+          $FT lookahead-analysis $CFG $STRAT --timerange ${{ inputs.timerange_in }} --minimum-trade-amount 10 --targeted-trade-amount 20 2>&1 | tee logs/lookahead.txt
+
+      - name: Recursive analysis
+        continue-on-error: true
+        shell: bash
+        run: |
+          $FT recursive-analysis $CFG $STRAT --timerange ${{ inputs.timerange_in }} 2>&1 | tee logs/recursive.txt
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          for f in backtest_in backtest_out lookahead recursive; do
+            if [ -f logs/$f.txt ]; then
+              echo "### $f" >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+              tail -n 80 logs/$f.txt >> $GITHUB_STEP_SUMMARY
+              echo '```' >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results
+          path: |
+            logs
+            user_data/backtest_results
