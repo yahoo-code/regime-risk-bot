@@ -4,7 +4,7 @@ RegimeRiskStrategy - stage 1 (rule-based, no ML yet)
 Layers:
   1) Regime filter (1h): EMA50 vs EMA200 + ADX. No trades in chop.
   2) Signal (15m): RSI pullback re-cross in the direction of the regime.
-  3) Risk: leverage 3x isolated, ATR-based trailing stop (hard cap),
+  3) Risk: leverage 3x isolated, ATR stop anchored at ENTRY (v2, not trailing; hard cap),
      time-decayed ROI, liquidation-proximity guard, protections.
 
 NOTE: untested template. Backtest + lookahead/recursive analysis first.
@@ -15,8 +15,9 @@ from typing import Optional
 import talib.abstract as ta
 from pandas import DataFrame
 
+from freqtrade.exchange import timeframe_to_prev_date
 from freqtrade.persistence import Trade
-from freqtrade.strategy import IStrategy, informative
+from freqtrade.strategy import IStrategy, informative, stoploss_from_absolute
 
 
 class RegimeRiskStrategy(IStrategy):
@@ -38,8 +39,8 @@ class RegimeRiskStrategy(IStrategy):
     rsi_long = 35           # long: RSI crosses back above this
     rsi_short = 65          # short: RSI crosses back below this
     min_atr_pct = 0.0015    # skip dead markets (fees would dominate)
-    atr_stop_mult = 2.0     # stop distance in ATRs (price terms)
-    min_stop = 0.03         # min stop, profit ratio (3% = ~1% price at 3x)
+    atr_stop_mult = 3.0     # v2: stop distance in ATRs (price terms), measured at entry
+    min_stop = 0.04         # v2: min stop, profit ratio (4% = ~1.33% price at 3x)
     liq_buffer = 0.05       # exit if price within 5% of liquidation price
 
     # Hard maximum loss (profit ratio). 3x => ~3.3% price move.
@@ -151,15 +152,32 @@ class RegimeRiskStrategy(IStrategy):
         after_fill: bool,
         **kwargs,
     ) -> Optional[float]:
-        """ATR-based stop that trails price (can only tighten), capped by self.stoploss."""
+        """
+        v2: stop price is fixed at ENTRY: open_rate -/+ atr_stop_mult * ATR(candle before entry),
+        floored by min_stop and capped by self.stoploss. It does not trail.
+        (v1 recomputed the stop from the current price every candle -> ~1% trailing stop,
+        which caused ~85% of exits and most of the loss in the first backtest.)
+        """
         df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
         if df is None or df.empty:
             return None
-        atr_pct = float(df.iloc[-1]["atr_pct"])
-        dist = self.atr_stop_mult * atr_pct * trade.leverage
-        dist = max(dist, self.min_stop)
-        dist = min(dist, abs(self.stoploss))
-        return -dist
+        entry_candle = timeframe_to_prev_date(self.timeframe, trade.open_date_utc)
+        prior = df.loc[df["date"] < entry_candle]
+        if prior.empty:
+            return None
+        atr = float(prior.iloc[-1]["atr"])
+
+        floor_price = self.min_stop / trade.leverage * trade.open_rate
+        cap_price = abs(self.stoploss) / trade.leverage * trade.open_rate
+        dist = min(max(self.atr_stop_mult * atr, floor_price), cap_price)
+        stop_price = trade.open_rate + dist if trade.is_short else trade.open_rate - dist
+
+        return stoploss_from_absolute(
+            stop_price,
+            current_rate,
+            is_short=trade.is_short,
+            leverage=trade.leverage,
+        )
 
     def custom_exit(
         self,
